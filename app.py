@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════════════════╗
-║  MODx Hosting Panel · Nebula Edition · v1.0 FINAL                     ║
+║  MODx Hosting Panel · Nebula Edition · v1.1 FINAL                     ║
 ║  Single-file, production-grade hosting platform                       ║
 ║                                                                       ║
-║  Features:                                                            ║
-║   • Python · Node.js · Static site hosting                            ║
-║   • Auto-detect + fully editable start / build commands               ║
-║   • ZIP / TAR upload with auto-extract (zip-slip safe)                ║
-║   • Subfolder file manager, in-browser editor, bulk upload            ║
-║   • Environment variables per instance                                ║
-║   • 24×7 watchdog · auto-restart · boot-restore                       ║
-║   • Streaming build console · live logs · activity feed               ║
-║   • Single-user auth · dark green "Nebula" theme                      ║
+║  • Python · Node.js · Static hosting                                  ║
+║  • Auto-detect + editable start / build commands                      ║
+║  • ZIP / TAR upload with auto-extract (zip-slip safe)                 ║
+║  • Subfolder file manager · in-browser editor · bulk upload           ║
+║  • Per-instance environment variables                                 ║
+║  • 24×7 watchdog · auto-restart · boot-restore                        ║
+║  • Streaming console · live logs · activity feed                      ║
+║  • Single-user auth · dark green "Nebula" theme                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
 """
 import os, re, sys, json, sqlite3, subprocess, secrets, time
@@ -41,7 +40,7 @@ for _d in (DATA_DIR, INST_DIR, LOG_DIR):
     os.makedirs(_d, exist_ok=True)
 
 PROCS = {}          # iid -> Popen
-LAST_START = {}     # iid -> ts (watchdog cooldown)
+LAST_START = {}     # iid -> timestamp (watchdog cooldown)
 BUILD_LOCK = threading.Lock()
 
 # ───────────────────────────── Error handlers ─────────────────────────
@@ -85,7 +84,7 @@ def init_db():
     """Create or migrate the schema. Safe to call on every boot."""
     d = db()
 
-    # --- Detect legacy / incompatible schema -----------------------------
+    # Detect legacy / incompatible schema
     cols = _table_columns(d, "instances")
     needs_rebuild = bool(cols) and ("slug" not in cols or "user_id" in cols)
     if needs_rebuild:
@@ -98,7 +97,6 @@ def init_db():
             try: d.execute("DROP TABLE instances")
             except Exception: pass
 
-    # --- Create fresh schema ---------------------------------------------
     d.executescript("""
     CREATE TABLE IF NOT EXISTS instances (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +127,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_activity_ts  ON activity(ts);
     """)
 
-    # --- Best-effort migration from legacy table -------------------------
+    # Best-effort migration from legacy table
     legacy_cols = _table_columns(d, "instances_legacy")
     if legacy_cols:
         print("[db] migrating rows from legacy table…", flush=True)
@@ -156,7 +154,7 @@ def init_db():
         except Exception as e:
             print("[db] row migration failed: %s" % e, flush=True)
 
-    # --- Safety net: ensure every expected column exists -----------------
+    # Safety net: ensure every expected column exists
     expected = {
         "slug": "TEXT", "work_dir": "TEXT DEFAULT ''",
         "start_cmd": "TEXT DEFAULT ''", "build_cmd": "TEXT DEFAULT ''",
@@ -258,14 +256,16 @@ def inst_work_dir(inst):
         return safe_join(inst_dir(inst), inst["work_dir"]) or inst_dir(inst)
     return inst_dir(inst)
 
-def inst_log(iid): return os.path.join(LOG_DIR, "inst_%d.log" % iid)
+# NOTE: renamed from `inst_log` to avoid colliding with the Flask route
+def inst_log_path(iid):
+    return os.path.join(LOG_DIR, "inst_%d.log" % iid)
 
 def is_running(iid):
     p = PROCS.get(iid)
     return bool(p and p.poll() is None)
 
 def read_log(iid, max_bytes=20000):
-    lp = inst_log(iid)
+    lp = inst_log_path(iid)
     if not os.path.exists(lp): return ""
     try:
         with open(lp, "rb") as f:
@@ -277,13 +277,13 @@ def read_log(iid, max_bytes=20000):
 
 def write_log(iid, text):
     try:
-        with open(inst_log(iid), "a") as f:
+        with open(inst_log_path(iid), "a") as f:
             f.write(text if text.endswith("\n") else text + "\n")
     except Exception:
         pass
 
 def clear_log(iid):
-    try: open(inst_log(iid), "w").close()
+    try: open(inst_log_path(iid), "w").close()
     except Exception: pass
 
 # ─────────────────────────────── Auto-detect ──────────────────────────
@@ -292,7 +292,7 @@ def detect_commands(idir, typ):
     start = ""
     build = ""
 
-    def has(f):  return os.path.isfile(os.path.join(idir, f))
+    def has(f):    return os.path.isfile(os.path.join(idir, f))
     def exists(f): return os.path.exists(os.path.join(idir, f))
 
     if typ == "python":
@@ -353,10 +353,9 @@ def detect_commands(idir, typ):
         elif has("server.js"):
             start = "node server.js"
 
-    # typ == "static" → no commands needed
     return start, build
 
-# ─────────────────────────────── Process ctrl ─────────────────────────
+# ─────────────────────────────── Process control ──────────────────────
 def _env_for(inst):
     env = dict(os.environ,
                PORT=str(inst["port"]),
@@ -372,7 +371,6 @@ def _env_for(inst):
     return env
 
 def run_streaming(iid, cmd, label, cwd, timeout=2400):
-    """Run a shell command and stream stdout/stderr into the instance log."""
     write_log(iid, "\n[%s] ▸ %s" % (label, cmd))
     write_log(iid, "[%s] cwd: %s" % (label, cwd))
     log_activity(iid, label, "running: %s" % cmd[:200])
@@ -405,7 +403,6 @@ def run_streaming(iid, cmd, label, cwd, timeout=2400):
 def start_inst(inst):
     if is_running(inst["id"]): return False
 
-    # Static sites have no process
     if inst["type"] == "static":
         d = db()
         d.execute("UPDATE instances SET status='running', last_boot=? WHERE id=?",
@@ -432,7 +429,7 @@ def start_inst(inst):
     wd = inst_work_dir(inst)
     os.makedirs(wd, exist_ok=True)
 
-    logf = open(inst_log(inst["id"]), "ab", buffering=0)
+    logf = open(inst_log_path(inst["id"]), "ab", buffering=0)
     logf.write(("\n[panel] ▶ launching at %s\n[panel] cmd: %s\n[panel] cwd: %s\n"
                 % (time.strftime("%Y-%m-%d %H:%M:%S"), cmd, wd)).encode())
     try:
@@ -1044,7 +1041,6 @@ def new_inst():
             idir = os.path.join(INST_DIR, dir_name)
             os.makedirs(idir, exist_ok=True)
 
-            # Scaffold starter files
             if typ == "python":
                 with open(os.path.join(idir, "main.py"), "w") as f: f.write(PY_MAIN)
                 with open(os.path.join(idir, "requirements.txt"), "w") as f: f.write(PY_REQ)
@@ -1397,7 +1393,7 @@ def inst_detail(iid):
 # ─────────────────────────────── File routes ──────────────────────────
 @app.route("/dashboard/i/<int:iid>/log")
 @login_required
-def inst_log(iid):
+def inst_log_view(iid):
     if not get_inst(iid): abort(404)
     return read_log(iid, 20000)
 
@@ -1931,7 +1927,7 @@ threading.Thread(target=watchdog, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print("\n╔══════════════════════════════════════════════════╗")
-    print("║  MODx Hosting Panel · Nebula Edition · v1.0       ║")
+    print("║  MODx Hosting Panel · Nebula Edition · v1.1       ║")
     print("╠══════════════════════════════════════════════════╣")
     print("║  URL       → http://0.0.0.0:%-5d                 ║" % port)
     print("║  Username  → %-35s║" % AUTH_USER)

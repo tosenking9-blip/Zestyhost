@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-╔═══════════════════════════════════════════════════════════════════╗
-║  MODx Hosting Panel · Nebula Edition                               ║
-║  Single-file, production-grade hosting platform                    ║
-║  Python · Node · Static · Custom commands · 24×7 · Auto-detect     ║
-║  Zip/Tar deploy · Sub-folders · Env vars · Watchdog · Live logs    ║
-╚═══════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════════╗
+║  MODx Hosting Panel · Nebula Edition · v1.0 FINAL                     ║
+║  Single-file, production-grade hosting platform                       ║
+║                                                                       ║
+║  Features:                                                            ║
+║   • Python · Node.js · Static site hosting                            ║
+║   • Auto-detect + fully editable start / build commands               ║
+║   • ZIP / TAR upload with auto-extract (zip-slip safe)                ║
+║   • Subfolder file manager, in-browser editor, bulk upload            ║
+║   • Environment variables per instance                                ║
+║   • 24×7 watchdog · auto-restart · boot-restore                       ║
+║   • Streaming build console · live logs · activity feed               ║
+║   • Single-user auth · dark green "Nebula" theme                      ║
+╚═══════════════════════════════════════════════════════════════════════╝
 """
-import os, re, sys, json, sqlite3, subprocess, secrets, time, shlex
+import os, re, sys, json, sqlite3, subprocess, secrets, time
 import socket, shutil, signal, threading, zipfile, io, tarfile
-import urllib.request, urllib.error, urllib.parse
+import urllib.request, urllib.error, urllib.parse, traceback
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for,
                    render_template_string, send_from_directory,
@@ -18,7 +26,8 @@ from flask import (Flask, request, session, redirect, url_for,
 # ─────────────────────────────── Config ───────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
-app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # 1 GB uploads
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024   # 1 GB uploads
+app.config["PROPAGATE_EXCEPTIONS"] = False
 
 AUTH_USER = os.environ.get("PANEL_USER", "Zesty")
 AUTH_PASS = os.environ.get("PANEL_PASS", "123456")
@@ -31,19 +40,65 @@ DB_PATH  = os.path.join(DATA_DIR, "hosting.db")
 for _d in (DATA_DIR, INST_DIR, LOG_DIR):
     os.makedirs(_d, exist_ok=True)
 
-PROCS = {}          # iid -> Popen (running process)
+PROCS = {}          # iid -> Popen
 LAST_START = {}     # iid -> ts (watchdog cooldown)
 BUILD_LOCK = threading.Lock()
+
+# ───────────────────────────── Error handlers ─────────────────────────
+@app.errorhandler(500)
+def _internal_error(e):
+    tb = traceback.format_exc()
+    print("\n[500]", e, "\n", tb, flush=True)
+    return Response(
+        "<html><body style='background:#040b07;color:#ff5577;"
+        "font-family:ui-monospace,monospace;padding:30px'>"
+        "<h2>◈ Internal Server Error</h2>"
+        "<p style='color:#7ea88f'>Check server logs for the full traceback.</p>"
+        "<pre style='background:#010704;color:#8affb5;padding:16px;"
+        "border-radius:10px;overflow:auto'>" + tb.replace("<", "&lt;") + "</pre>"
+        "</body></html>", 500)
+
+@app.errorhandler(404)
+def _not_found(e):
+    return Response(
+        "<html><body style='background:#040b07;color:#7ea88f;"
+        "font-family:ui-monospace,monospace;padding:30px'>"
+        "<h2 style='color:#e6fff0'>◈ 404 — Not Found</h2>"
+        "<p><a href='/' style='color:#5bffce'>← Back to panel</a></p>"
+        "</body></html>", 404)
 
 # ─────────────────────────────── Database ─────────────────────────────
 def db():
     c = sqlite3.connect(DB_PATH, timeout=20)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA foreign_keys=ON")
     return c
 
+def _table_columns(d, table):
+    try:
+        return {r["name"] for r in d.execute("PRAGMA table_info(%s)" % table)}
+    except Exception:
+        return set()
+
 def init_db():
+    """Create or migrate the schema. Safe to call on every boot."""
     d = db()
+
+    # --- Detect legacy / incompatible schema -----------------------------
+    cols = _table_columns(d, "instances")
+    needs_rebuild = bool(cols) and ("slug" not in cols or "user_id" in cols)
+    if needs_rebuild:
+        print("[db] legacy 'instances' schema detected — rebuilding table", flush=True)
+        try:
+            d.execute("DROP TABLE IF EXISTS instances_legacy")
+            d.execute("ALTER TABLE instances RENAME TO instances_legacy")
+        except Exception as e:
+            print("[db] rename failed (%s) — dropping table" % e, flush=True)
+            try: d.execute("DROP TABLE instances")
+            except Exception: pass
+
+    # --- Create fresh schema ---------------------------------------------
     d.executescript("""
     CREATE TABLE IF NOT EXISTS instances (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,7 +125,54 @@ def init_db():
         message  TEXT,
         ts       INTEGER
     );
+    CREATE INDEX IF NOT EXISTS idx_activity_iid ON activity(iid);
+    CREATE INDEX IF NOT EXISTS idx_activity_ts  ON activity(ts);
     """)
+
+    # --- Best-effort migration from legacy table -------------------------
+    legacy_cols = _table_columns(d, "instances_legacy")
+    if legacy_cols:
+        print("[db] migrating rows from legacy table…", flush=True)
+        try:
+            rows = d.execute("SELECT * FROM instances_legacy").fetchall()
+            for r in rows:
+                keys = set(r.keys())
+                name = (r["name"] if "name" in keys else "app") or "app"
+                base = re.sub(r'[^a-z0-9-]+', '-', str(name).lower()).strip('-') or "app"
+                slug = base + "-" + secrets.token_hex(2)
+                typ  = r["type"]       if "type"       in keys else "static"
+                port = r["port"]       if "port"       in keys else None
+                dr   = r["dir"]        if "dir"        in keys else ""
+                st   = r["status"]     if "status"     in keys else "stopped"
+                ct   = r["created_at"] if "created_at" in keys else now()
+                d.execute(
+                    "INSERT OR IGNORE INTO instances "
+                    "(name,slug,type,work_dir,start_cmd,build_cmd,env,"
+                    " port,dir,status,autostart,auto_build,deps_ready,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (name, slug, typ, "", "", "", "", port, dr, st, 1, 1, 0, ct))
+            d.execute("DROP TABLE instances_legacy")
+            print("[db] migration complete", flush=True)
+        except Exception as e:
+            print("[db] row migration failed: %s" % e, flush=True)
+
+    # --- Safety net: ensure every expected column exists -----------------
+    expected = {
+        "slug": "TEXT", "work_dir": "TEXT DEFAULT ''",
+        "start_cmd": "TEXT DEFAULT ''", "build_cmd": "TEXT DEFAULT ''",
+        "env": "TEXT DEFAULT ''", "autostart": "INTEGER DEFAULT 1",
+        "auto_build": "INTEGER DEFAULT 1", "deps_ready": "INTEGER DEFAULT 0",
+        "last_boot": "INTEGER",
+    }
+    have = _table_columns(d, "instances")
+    for col, decl in expected.items():
+        if col not in have:
+            try:
+                d.execute("ALTER TABLE instances ADD COLUMN %s %s" % (col, decl))
+                print("[db] added missing column:", col, flush=True)
+            except Exception as e:
+                print("[db] could not add column", col, "->", e, flush=True)
+
     d.commit(); d.close()
 
 # ─────────────────────────────── Helpers ──────────────────────────────
@@ -82,7 +184,7 @@ def log_activity(iid, kind, message):
         d.execute("INSERT INTO activity(iid,kind,message,ts) VALUES(?,?,?,?)",
                   (iid, kind, (message or "")[:500], now()))
         d.execute("DELETE FROM activity WHERE id NOT IN "
-                  "(SELECT id FROM activity ORDER BY id DESC LIMIT 400)")
+                  "(SELECT id FROM activity ORDER BY id DESC LIMIT 500)")
         d.commit(); d.close()
     except Exception:
         pass
@@ -107,7 +209,8 @@ def alloc_port():
 def human_size(n):
     f = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if f < 1024: return ("%d %s" % (f, unit)) if unit == "B" else ("%.1f %s" % (f, unit))
+        if f < 1024:
+            return ("%d %s" % (f, unit)) if unit == "B" else ("%.1f %s" % (f, unit))
         f /= 1024.0
     return "%.1f PB" % f
 
@@ -161,7 +264,7 @@ def is_running(iid):
     p = PROCS.get(iid)
     return bool(p and p.poll() is None)
 
-def read_log(iid, max_bytes=16000):
+def read_log(iid, max_bytes=20000):
     lp = inst_log(iid)
     if not os.path.exists(lp): return ""
     try:
@@ -185,36 +288,31 @@ def clear_log(iid):
 
 # ─────────────────────────────── Auto-detect ──────────────────────────
 def detect_commands(idir, typ):
-    """Return (start_cmd, build_cmd) detected from the project layout."""
+    """Return (start_cmd, build_cmd) inferred from a project layout."""
     start = ""
     build = ""
 
-    def has(f): return os.path.isfile(os.path.join(idir, f))
+    def has(f):  return os.path.isfile(os.path.join(idir, f))
     def exists(f): return os.path.exists(os.path.join(idir, f))
 
     if typ == "python":
-        # Django
         if has("manage.py"):
             start = "python3 manage.py runserver 0.0.0.0:$PORT"
             if has("requirements.txt"):
                 build = "pip install -r requirements.txt"
-        # FastAPI / uvicorn
         elif has("main.py") or has("app.py") or has("server.py"):
-            entry = None
-            for f in ("main.py", "app.py", "server.py"):
-                if has(f): entry = f; break
+            entry = next(f for f in ("main.py", "app.py", "server.py") if has(f))
             if exists("requirements.txt"):
                 try:
                     reqs = open(os.path.join(idir, "requirements.txt")).read().lower()
-                    if "fastapi" in reqs or "uvicorn" in reqs:
-                        mod = "main:app" if entry == "main.py" else "app:app"
-                        start = "uvicorn %s --host 0.0.0.0 --port $PORT" % mod
-                    else:
-                        start = "python3 %s" % entry
-                    build = "pip install -r requirements.txt"
                 except Exception:
+                    reqs = ""
+                if "fastapi" in reqs or "uvicorn" in reqs:
+                    mod = "main:app" if entry == "main.py" else "app:app"
+                    start = "uvicorn %s --host 0.0.0.0 --port $PORT" % mod
+                else:
                     start = "python3 %s" % entry
-                    build = "pip install -r requirements.txt"
+                build = "pip install -r requirements.txt"
             else:
                 start = "python3 %s" % entry
         elif has("bot.py"):
@@ -226,6 +324,7 @@ def detect_commands(idir, typ):
 
     elif typ == "node":
         pkg = os.path.join(idir, "package.json")
+        scripts = {}
         if os.path.isfile(pkg):
             try:
                 data = json.load(open(pkg))
@@ -254,10 +353,7 @@ def detect_commands(idir, typ):
         elif has("server.js"):
             start = "node server.js"
 
-    elif typ == "static":
-        start = ""
-        build = ""
-
+    # typ == "static" → no commands needed
     return start, build
 
 # ─────────────────────────────── Process ctrl ─────────────────────────
@@ -285,8 +381,7 @@ def run_streaming(iid, cmd, label, cwd, timeout=2400):
             cmd, cwd=cwd, shell=True, executable="/bin/bash",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=dict(os.environ, PYTHONUNBUFFERED="1"),
-            preexec_fn=os.setsid
-        )
+            preexec_fn=os.setsid)
         start = time.time()
         for raw in iter(p.stdout.readline, b""):
             write_log(iid, "[%s] %s" % (label, raw.decode("utf-8", "replace").rstrip()))
@@ -297,8 +392,10 @@ def run_streaming(iid, cmd, label, cwd, timeout=2400):
                 break
         p.wait(timeout=30)
         code = p.returncode
-        write_log(iid, "[%s] %s (exit %d)" % (label, "✓ finished" if code == 0 else "✗ failed", code))
-        log_activity(iid, label, "%s (exit %d)" % ("finished" if code == 0 else "failed", code))
+        write_log(iid, "[%s] %s (exit %d)" % (label,
+                    "✓ finished" if code == 0 else "✗ failed", code))
+        log_activity(iid, label, "%s (exit %d)" % (
+                    "finished" if code == 0 else "failed", code))
         return code
     except Exception as e:
         write_log(iid, "[%s] ✗ error: %s" % (label, e))
@@ -308,10 +405,11 @@ def run_streaming(iid, cmd, label, cwd, timeout=2400):
 def start_inst(inst):
     if is_running(inst["id"]): return False
 
-    # Static — nothing to spawn
+    # Static sites have no process
     if inst["type"] == "static":
         d = db()
-        d.execute("UPDATE instances SET status='running', last_boot=? WHERE id=?", (now(), inst["id"]))
+        d.execute("UPDATE instances SET status='running', last_boot=? WHERE id=?",
+                  (now(), inst["id"]))
         d.commit(); d.close()
         log_activity(inst["id"], "start", "Static live")
         return True
@@ -341,11 +439,11 @@ def start_inst(inst):
         p = subprocess.Popen(
             cmd, cwd=wd, shell=True, executable="/bin/bash",
             stdout=logf, stderr=logf, env=_env_for(inst),
-            preexec_fn=os.setsid, close_fds=True
-        )
+            preexec_fn=os.setsid, close_fds=True)
         PROCS[inst["id"]] = p
         d = db()
-        d.execute("UPDATE instances SET status='running', last_boot=? WHERE id=?", (now(), inst["id"]))
+        d.execute("UPDATE instances SET status='running', last_boot=? WHERE id=?",
+                  (now(), inst["id"]))
         d.commit(); d.close()
         log_activity(inst["id"], "start", "Started (pid %d): %s" % (p.pid, cmd[:120]))
         return True
@@ -374,9 +472,8 @@ def restart_inst(inst):
     time.sleep(0.6)
     return start_inst(inst)
 
-# ─────────────────────────────── Build / install ──────────────────────
+# ─────────────────────────────── Build ────────────────────────────────
 def build_inst(iid, async_=True):
-    """Run build command (install + compile) in background."""
     def work():
         with BUILD_LOCK:
             inst = get_inst(iid)
@@ -409,12 +506,11 @@ def watchdog():
         try:
             d = db()
             rows = d.execute(
-                "SELECT * FROM instances WHERE autostart=1 AND type!='static'"
+                "SELECT * FROM instances WHERE status='running' "
+                "AND autostart=1 AND type!='static'"
             ).fetchall()
             d.close()
             for r in rows:
-                # only consider instances that were marked running
-                if r["status"] != "running": continue
                 if is_running(r["id"]): continue
                 if time.time() - LAST_START.get(r["id"], 0) < 6: continue
                 LAST_START[r["id"]] = time.time()
@@ -424,19 +520,20 @@ def watchdog():
                     log_activity(inst["id"], "watchdog", "Auto-restart triggered")
                     start_inst(inst)
         except Exception as e:
-            print("[watchdog]", e)
+            print("[watchdog]", e, flush=True)
         time.sleep(6)
 
-# ─────────────────────────────── Archive utils ────────────────────────
+# ─────────────────────────────── Archives ─────────────────────────────
 def extract_zip_bytes(data, target, strip_root=False):
     count = 0
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         members = [m for m in z.infolist() if not m.is_dir()]
+        single_root = None
         if strip_root and members:
-            roots = set(m.filename.split("/", 1)[0] for m in members if "/" in m.filename)
-            single_root = next(iter(roots)) if len(roots) == 1 and all("/" in m.filename for m in members) else None
-        else:
-            single_root = None
+            roots = set(m.filename.split("/", 1)[0]
+                        for m in members if "/" in m.filename)
+            if len(roots) == 1 and all("/" in m.filename for m in members):
+                single_root = next(iter(roots))
         for m in members:
             rel_raw = m.filename.replace("\\", "/")
             if single_root and rel_raw.startswith(single_root + "/"):
@@ -457,7 +554,8 @@ def extract_tar_bytes(data, target, strip_root=False):
         members = [m for m in t.getmembers() if m.isfile()]
         single_root = None
         if strip_root and members:
-            roots = set(m.name.split("/", 1)[0] for m in members if "/" in m.name)
+            roots = set(m.name.split("/", 1)[0]
+                        for m in members if "/" in m.name)
             if len(roots) == 1 and all("/" in m.name for m in members):
                 single_root = next(iter(roots))
         for m in members:
@@ -480,11 +578,12 @@ def extract_archive(data, filename, target, strip_root=False):
     low = filename.lower()
     if low.endswith(".zip"):
         return extract_zip_bytes(data, target, strip_root), "zip"
-    if low.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+    if low.endswith((".tar", ".tar.gz", ".tgz",
+                     ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
         return extract_tar_bytes(data, target, strip_root), "tar"
-    raise ValueError("Unsupported archive type: " + filename)
+    raise ValueError("Unsupported archive: " + filename)
 
-# ─────────────────────────────── CSS / Theme ──────────────────────────
+# ─────────────────────────────── Theme ────────────────────────────────
 CSS = r"""
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -494,7 +593,8 @@ CSS = r"""
   --ok:#00ff9d;--warn:#ffcc44;--err:#ff5577;--info:#5bffce;
   --txt:#e6fff0;--mut:#7ea88f;--mut2:#527a63;
 }
-html,body{background:var(--bg);color:var(--txt);font-family:'Inter',system-ui,-apple-system,sans-serif;
+html,body{background:var(--bg);color:var(--txt);
+  font-family:'Inter',system-ui,-apple-system,sans-serif;
   min-height:100vh;line-height:1.55;-webkit-font-smoothing:antialiased;font-size:14px}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-2;
   background:
@@ -523,23 +623,28 @@ a:hover{color:var(--pri3)}
   display:grid;place-items:center;color:#04180d;
   font-family:'JetBrains Mono',monospace;font-weight:700;font-size:14px;
   box-shadow:0 4px 20px rgba(0,255,157,.35)}
-.brand .name{font-family:'JetBrains Mono',monospace;font-weight:700;letter-spacing:-0.2px;
+.brand .name{font-family:'JetBrains Mono',monospace;font-weight:700;
+  letter-spacing:-0.2px;
   background:linear-gradient(135deg,var(--pri),var(--pri2));
   -webkit-background-clip:text;background-clip:text;
   -webkit-text-fill-color:transparent}
 .nav{display:flex;gap:3px;align-items:center;flex-wrap:wrap}
-.nav a{color:var(--mut);font-size:13px;padding:7px 14px;border-radius:9px;transition:all .15s;font-weight:500}
+.nav a{color:var(--mut);font-size:13px;padding:7px 14px;border-radius:9px;
+  transition:all .15s;font-weight:500}
 .nav a:hover,.nav a.active{color:var(--txt);background:var(--surf2);text-decoration:none}
-.nav a.cta{background:linear-gradient(135deg,var(--pri),var(--pri2));color:#04180d;font-weight:600}
+.nav a.cta{background:linear-gradient(135deg,var(--pri),var(--pri2));
+  color:#04180d;font-weight:600}
 .nav a.cta:hover{box-shadow:0 6px 22px rgba(0,255,157,.38);color:#04180d}
 
-.btn{display:inline-flex;align-items:center;gap:7px;padding:9px 17px;border-radius:11px;
-  font-size:13px;font-weight:500;border:none;cursor:pointer;font-family:inherit;
-  transition:all .18s;text-decoration:none;line-height:1;white-space:nowrap}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:9px 17px;
+  border-radius:11px;font-size:13px;font-weight:500;border:none;cursor:pointer;
+  font-family:inherit;transition:all .18s;text-decoration:none;line-height:1;white-space:nowrap}
 .btn-p{background:linear-gradient(135deg,var(--pri),var(--pri2));color:#04180d;font-weight:600}
-.btn-p:hover{transform:translateY(-1px);box-shadow:0 10px 28px rgba(0,255,157,.35);text-decoration:none;color:#04180d}
+.btn-p:hover{transform:translateY(-1px);box-shadow:0 10px 28px rgba(0,255,157,.35);
+  text-decoration:none;color:#04180d}
 .btn-g{background:var(--surf2);color:var(--txt);border:1px solid var(--brd)}
-.btn-g:hover{border-color:var(--pri);background:rgba(0,255,157,.08);text-decoration:none;color:var(--txt)}
+.btn-g:hover{border-color:var(--pri);background:rgba(0,255,157,.08);
+  text-decoration:none;color:var(--txt)}
 .btn-d{background:rgba(255,85,119,.10);color:var(--err);border:1px solid rgba(255,85,119,.28)}
 .btn-d:hover{background:rgba(255,85,119,.18);text-decoration:none;color:var(--err)}
 .btn-w{background:rgba(255,204,68,.10);color:var(--warn);border:1px solid rgba(255,204,68,.28)}
@@ -554,7 +659,8 @@ a:hover{color:var(--pri3)}
 .card:hover{border-color:var(--brd2)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
 
-h1{font-size:clamp(24px,3.4vw,36px);font-weight:700;letter-spacing:-0.9px;margin-bottom:10px;line-height:1.15}
+h1{font-size:clamp(24px,3.4vw,36px);font-weight:700;letter-spacing:-0.9px;
+  margin-bottom:10px;line-height:1.15}
 h2{font-size:20px;font-weight:600;margin-bottom:14px;letter-spacing:-0.3px}
 h3{font-size:15px;font-weight:600;margin-bottom:6px}
 .mut{color:var(--mut);font-size:14px}
@@ -562,24 +668,29 @@ h3{font-size:15px;font-weight:600;margin-bottom:6px}
 .small{font-size:12px}
 .mono{font-family:'JetBrains Mono',monospace}
 
-.tag{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:100px;
-  font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:500;line-height:1.5}
-.tag .dot{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
+.tag{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;
+  border-radius:100px;font-size:11px;font-family:'JetBrains Mono',monospace;
+  font-weight:500;line-height:1.5}
+.tag .dot{width:6px;height:6px;border-radius:50%;background:currentColor;
+  box-shadow:0 0 8px currentColor}
 .tag-ok{background:rgba(0,255,157,.10);color:var(--ok);border:1px solid rgba(0,255,157,.22)}
 .tag-off{background:rgba(126,168,143,.10);color:var(--mut);border:1px solid rgba(126,168,143,.18)}
 .tag-info{background:rgba(91,255,206,.10);color:var(--info);border:1px solid rgba(91,255,206,.22)}
 .tag-warn{background:rgba(255,204,68,.10);color:var(--warn);border:1px solid rgba(255,204,68,.25)}
 
 input,select,textarea{width:100%;padding:11px 14px;background:var(--surf2);
-  border:1px solid var(--brd);border-radius:11px;color:var(--txt);font-family:inherit;
-  font-size:14px;outline:none;transition:all .18s}
-input:focus,select:focus,textarea:focus{border-color:var(--pri);background:var(--surf3);
-  box-shadow:0 0 0 3px rgba(0,255,157,.10)}
+  border:1px solid var(--brd);border-radius:11px;color:var(--txt);
+  font-family:inherit;font-size:14px;outline:none;transition:all .18s}
+input:focus,select:focus,textarea:focus{border-color:var(--pri);
+  background:var(--surf3);box-shadow:0 0 0 3px rgba(0,255,157,.10)}
+input[type=checkbox]{width:auto;padding:0;margin:0}
 textarea{font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.6;resize:vertical}
 select{cursor:pointer}
-label{display:block;font-size:12px;color:var(--mut);margin-bottom:7px;font-weight:500;letter-spacing:.2px}
+label{display:block;font-size:12px;color:var(--mut);margin-bottom:7px;
+  font-weight:500;letter-spacing:.2px}
 .field{margin-bottom:16px}
-.field .hint{font-size:11px;color:var(--mut2);margin-top:6px;font-family:'JetBrains Mono',monospace;line-height:1.55}
+.field .hint{font-size:11px;color:var(--mut2);margin-top:6px;
+  font-family:'JetBrains Mono',monospace;line-height:1.55}
 .field .hint code{background:var(--surf2);padding:1px 6px;border-radius:5px;color:var(--pri2)}
 
 .flash{padding:12px 16px;border-radius:11px;font-size:13px;margin-bottom:16px;
@@ -602,38 +713,43 @@ code{font-family:'JetBrains Mono',monospace;font-size:12px;
   background:var(--surf2);padding:1px 6px;border-radius:5px;color:var(--pri2)}
 pre code{background:none;padding:0;color:inherit}
 
-.cmd-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:8px;
-  background:var(--surf2);border:1px solid var(--brd);font-family:'JetBrains Mono',monospace;
-  font-size:12px;color:var(--pri2);max-width:100%;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
+.cmd-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;
+  border-radius:8px;background:var(--surf2);border:1px solid var(--brd);
+  font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--pri2);
+  max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-.center{min-height:calc(100vh - 70px);display:flex;align-items:center;justify-content:center;padding:24px}
+.center{min-height:calc(100vh - 70px);display:flex;align-items:center;
+  justify-content:center;padding:24px}
 .auth-card{width:100%;max-width:420px;
   background:linear-gradient(180deg,var(--surf),rgba(10,26,18,0.85));
   border:1px solid var(--brd);border-radius:22px;padding:40px;
   box-shadow:0 30px 90px rgba(0,0,0,.55)}
 .auth-mark{width:58px;height:58px;border-radius:16px;margin:0 auto 20px;
-  background:linear-gradient(135deg,var(--pri),var(--pri2));display:grid;place-items:center;
-  color:#04180d;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:24px;
+  background:linear-gradient(135deg,var(--pri),var(--pri2));
+  display:grid;place-items:center;color:#04180d;
+  font-family:'JetBrains Mono',monospace;font-weight:700;font-size:24px;
   box-shadow:0 14px 44px rgba(0,255,157,.42)}
 
 .hero{padding:72px 0 32px;text-align:center}
-.hero .badge{display:inline-flex;align-items:center;gap:8px;padding:6px 15px;border-radius:100px;
-  background:rgba(0,255,157,.08);border:1px solid rgba(0,255,157,.22);
-  color:var(--pri2);font-size:11px;font-weight:500;margin-bottom:24px;
-  font-family:'JetBrains Mono',monospace;letter-spacing:.5px;text-transform:uppercase}
-.hero h1{font-size:clamp(34px,5.2vw,60px);line-height:1.05;letter-spacing:-2px;margin-bottom:18px}
+.hero .badge{display:inline-flex;align-items:center;gap:8px;padding:6px 15px;
+  border-radius:100px;background:rgba(0,255,157,.08);
+  border:1px solid rgba(0,255,157,.22);color:var(--pri2);font-size:11px;
+  font-weight:500;margin-bottom:24px;font-family:'JetBrains Mono',monospace;
+  letter-spacing:.5px;text-transform:uppercase}
+.hero h1{font-size:clamp(34px,5.2vw,60px);line-height:1.05;
+  letter-spacing:-2px;margin-bottom:18px}
 .hero .grad{background:linear-gradient(135deg,var(--pri) 0%,var(--pri2) 50%,var(--pri3) 100%);
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.hero p{max-width:640px;margin:0 auto 34px;color:var(--mut);font-size:16px;line-height:1.65}
+.hero p{max-width:640px;margin:0 auto 34px;color:var(--mut);
+  font-size:16px;line-height:1.65}
 
 .feature{padding:24px;border-radius:16px;
   background:linear-gradient(180deg,var(--surf),rgba(10,26,18,0.5));
   border:1px solid var(--brd);transition:all .25s}
 .feature:hover{border-color:var(--brd2);transform:translateY(-2px)}
-.feature .ico{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;
-  background:rgba(0,255,157,.09);border:1px solid rgba(0,255,157,.22);
-  font-size:20px;margin-bottom:14px}
+.feature .ico{width:44px;height:44px;border-radius:12px;display:grid;
+  place-items:center;background:rgba(0,255,157,.09);
+  border:1px solid rgba(0,255,157,.22);font-size:20px;margin-bottom:14px}
 .feature h3{font-size:15px;margin-bottom:6px}
 .feature p{font-size:13px;color:var(--mut);line-height:1.6}
 
@@ -641,12 +757,13 @@ pre code{background:none;padding:0;color:inherit}
   border:1px solid var(--brd);position:relative;overflow:hidden}
 .stat::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
   background:linear-gradient(180deg,var(--pri),var(--pri2))}
-.stat .lbl{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.8px;font-weight:500}
+.stat .lbl{font-size:11px;color:var(--mut);text-transform:uppercase;
+  letter-spacing:.8px;font-weight:500}
 .stat .val{font-size:28px;font-weight:700;margin-top:6px;letter-spacing:-1px}
 
 .crumb{font-family:'JetBrains Mono',monospace;font-size:13px;padding:11px 15px;
-  background:var(--surf2);border-radius:11px;margin-bottom:13px;word-break:break-all;
-  border:1px solid var(--brd)}
+  background:var(--surf2);border-radius:11px;margin-bottom:13px;
+  word-break:break-all;border:1px solid var(--brd)}
 .crumb a{color:var(--pri2)}
 .crumb .sep{color:var(--mut2);margin:0 6px}
 
@@ -670,11 +787,9 @@ pre code{background:none;padding:0;color:inherit}
 .tab-panel{display:none}
 .tab-panel.active{display:block}
 
-.bar{height:8px;border-radius:100px;background:var(--surf2);overflow:hidden;border:1px solid var(--brd)}
-.bar > div{height:100%;background:linear-gradient(90deg,var(--pri),var(--pri2));transition:width .3s}
-
-.dot-live{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);
-  box-shadow:0 0 0 0 rgba(0,255,157,.6);animation:pulse 2s infinite}
+.dot-live{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--ok);box-shadow:0 0 0 0 rgba(0,255,157,.6);
+  animation:pulse 2s infinite}
 @keyframes pulse{
   0%{box-shadow:0 0 0 0 rgba(0,255,157,.6)}
   70%{box-shadow:0 0 0 8px rgba(0,255,157,0)}
@@ -741,7 +856,8 @@ function switchTab(name){
 }
 function copyCmd(txt, el){
   navigator.clipboard.writeText(txt).then(function(){
-    if(el){ var o = el.textContent; el.textContent = '✓ Copied'; setTimeout(function(){ el.textContent = o; }, 1100); }
+    if(el){ var o = el.textContent; el.textContent = '✓ Copied';
+      setTimeout(function(){ el.textContent = o; }, 1100); }
   });
 }
 window.addEventListener('DOMContentLoaded', function(){
@@ -778,20 +894,21 @@ def index():
 
 <div class="grid" style="margin-top:64px">
   <div class="feature"><div class="ico">◈</div><h3>Auto-detect Runtime</h3>
-    <p>Drop a project — we scan for <code>package.json</code>, <code>requirements.txt</code>,
-       <code>main.py</code>, <code>index.js</code>, <code>manage.py</code> and pick the right commands.</p></div>
+    <p>Drop a project — we scan for <code>package.json</code>,
+       <code>requirements.txt</code>, <code>main.py</code>, <code>index.js</code>,
+       <code>manage.py</code> and pick the right commands.</p></div>
   <div class="feature"><div class="ico">⚙</div><h3>Custom Start &amp; Build</h3>
-    <p>Override anything. Set your own <b>start command</b> and <b>build command</b> per instance.
-       They support shell syntax and <code>$PORT</code>.</p></div>
+    <p>Override anything. Set your own <b>start command</b> and <b>build command</b>
+       per instance. They support shell syntax and <code>$PORT</code>.</p></div>
   <div class="feature"><div class="ico">📦</div><h3>Zip · Tar · Bulk Upload</h3>
-    <p>Upload <code>.zip</code>, <code>.tar.gz</code>, or many files at once. Auto-extract with
-       zip-slip protection and optional root-folder stripping.</p></div>
+    <p>Upload <code>.zip</code>, <code>.tar.gz</code>, or many files at once.
+       Auto-extract with zip-slip protection and optional root-folder stripping.</p></div>
   <div class="feature"><div class="ico">🛡</div><h3>Always-On Watchdog</h3>
-    <p>Process died? We restart it in under 6 seconds. Panel restarted? Everything boots back
-       automatically — 24×7.</p></div>
+    <p>Process died? We restart it in under 6 seconds. Panel restarted?
+       Everything boots back automatically — 24×7.</p></div>
   <div class="feature"><div class="ico">📜</div><h3>Streaming Console</h3>
-    <p>Live stdout/stderr in the browser. Dependency installs and build steps stream into the
-       same console, so you always see what's happening.</p></div>
+    <p>Live stdout/stderr in the browser. Dependency installs and build steps
+       stream into the same console, so you always see what's happening.</p></div>
   <div class="feature"><div class="ico">🗂</div><h3>Full File Manager</h3>
     <p>Browse, edit, create folders, delete recursively — from the browser.
        Sub-folder uploads, nested paths, everything supported.</p></div>
@@ -845,7 +962,8 @@ def dashboard():
     d.close()
 
     total = len(rows)
-    running = sum(1 for r in rows if is_running(r["id"]) or (r["type"]=="static" and r["status"]=="running"))
+    running = sum(1 for r in rows
+                  if is_running(r["id"]) or (r["type"]=="static" and r["status"]=="running"))
 
     cards = ""
     for r in rows:
@@ -853,7 +971,8 @@ def dashboard():
         tag = ('<span class="tag tag-ok"><span class="dot"></span>Live</span>'
                if is_live else
                '<span class="tag tag-off"><span class="dot"></span>Idle</span>')
-        open_btn = ('<a href="/app/%d/" target="_blank" class="btn btn-g btn-s">Open ↗</a>' % r["id"]) if is_live else ''
+        open_btn = ('<a href="/app/%d/" target="_blank" class="btn btn-g btn-s">Open ↗</a>'
+                    % r["id"]) if is_live else ''
         cmd = (r["start_cmd"] or "").strip()
         cmd_html = ('<div class="cmd-chip" title="%s">$ %s</div>' % (esc(cmd), esc(cmd))
                     if cmd else
@@ -887,15 +1006,17 @@ def dashboard():
         '<p class="mut">Signed in as <b>' + AUTH_USER + '</b> · watchdog active</p></div>'
         '<a href="/dashboard/new" class="btn btn-p">＋ New Instance</a></div>'
 
-        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:26px">'
-        '<div class="stat"><div class="lbl">Total Instances</div><div class="val">' + str(total) + '</div></div>'
+        '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'
+        'gap:14px;margin-bottom:26px">'
+        '<div class="stat"><div class="lbl">Total Instances</div><div class="val">'
+        + str(total) + '</div></div>'
         '<div class="stat"><div class="lbl">Live Now</div>'
         '<div class="val" style="color:var(--ok)">' + str(running) + '</div></div>'
         '<div class="stat"><div class="lbl">Stopped</div>'
         '<div class="val" style="color:var(--mut)">' + str(total - running) + '</div></div>'
         '<div class="stat"><div class="lbl">Watchdog</div>'
-        '<div class="val" style="font-size:15px;padding-top:8px"><span class="dot-live"></span> '
-        'every 6 s</div></div>'
+        '<div class="val" style="font-size:15px;padding-top:8px">'
+        '<span class="dot-live"></span> every 6 s</div></div>'
         '</div>'
 
         '<div class="grid">' + cards + '</div>'
@@ -914,8 +1035,8 @@ def new_inst():
         if typ not in ("python", "node", "static"):
             typ = "static"
         try:
-            slug = re.sub(r'[^a-zA-Z0-9_-]+', '-', name).strip('-').lower()[:36] or "app"
-            base_slug = slug; n = 1
+            base_slug = re.sub(r'[^a-zA-Z0-9_-]+', '-', name).strip('-').lower()[:36] or "app"
+            slug = base_slug; n = 1
             d = db()
             while d.execute("SELECT 1 FROM instances WHERE slug=?", (slug,)).fetchone():
                 n += 1; slug = base_slug + "-" + str(n)
@@ -925,18 +1046,13 @@ def new_inst():
 
             # Scaffold starter files
             if typ == "python":
-                with open(os.path.join(idir, "main.py"), "w") as f:
-                    f.write(PY_MAIN)
-                with open(os.path.join(idir, "requirements.txt"), "w") as f:
-                    f.write(PY_REQ)
+                with open(os.path.join(idir, "main.py"), "w") as f: f.write(PY_MAIN)
+                with open(os.path.join(idir, "requirements.txt"), "w") as f: f.write(PY_REQ)
             elif typ == "node":
-                with open(os.path.join(idir, "index.js"), "w") as f:
-                    f.write(NODE_MAIN)
-                with open(os.path.join(idir, "package.json"), "w") as f:
-                    f.write(NODE_PKG)
+                with open(os.path.join(idir, "index.js"), "w") as f: f.write(NODE_MAIN)
+                with open(os.path.join(idir, "package.json"), "w") as f: f.write(NODE_PKG)
             elif typ == "static":
-                with open(os.path.join(idir, "index.html"), "w") as f:
-                    f.write(STATIC_HTML)
+                with open(os.path.join(idir, "index.html"), "w") as f: f.write(STATIC_HTML)
 
             start_cmd, build_cmd = detect_commands(idir, typ)
             port = alloc_port()
@@ -947,14 +1063,16 @@ def new_inst():
                 (name, slug, typ, "", start_cmd, build_cmd, "",
                  port, dir_name, "stopped", 1, 1, now()))
             d.commit(); iid = cur.lastrowid; d.close()
+            log_activity(iid, "create", "Instance '%s' created (%s)" % (name, typ))
             flash("Instance '" + name + "' created", "ok")
             return redirect(url_for("inst_detail", iid=iid))
         except Exception as e:
+            print("[new_inst]", e, "\n", traceback.format_exc(), flush=True)
             flash("Error: " + str(e), "err")
     body = """
 <h1>New Instance</h1>
-<p class="mut" style="margin-bottom:22px">Pick a runtime — we'll scaffold a starter project
-   and auto-detect the start &amp; build commands.</p>
+<p class="mut" style="margin-bottom:22px">Pick a runtime — we'll scaffold a starter
+   project and auto-detect the start &amp; build commands.</p>
 <div style="max-width:600px"><div class="card">
 <form method="post">
   <div class="field">
@@ -988,7 +1106,7 @@ def inst_detail(iid):
     path = norm_rel(request.args.get("p", ""))
     is_live = is_running(iid) or (inst["type"] == "static" and inst["status"] == "running")
 
-    # File listing
+    # ── File listing
     base = inst_dir(inst)
     target = safe_join(base, path) if path else base
     rows_html = ""
@@ -1010,42 +1128,46 @@ def inst_detail(iid):
             if is_dir:
                 rows_html += (
                     '<tr>'
-                    '<td>📁 <a href="/dashboard/i/' + str(iid) + '?p=' + q + '"><b>' + esc(n) + '</b>/</a></td>'
+                    '<td>📁 <a href="/dashboard/i/' + str(iid) + '?p=' + q + '"><b>'
+                    + esc(n) + '</b>/</a></td>'
                     '<td class="mut mono" style="font-size:11px">folder</td>'
                     '<td style="text-align:right">'
-                    '<form method="post" action="/dashboard/i/' + str(iid) + '/delete-file" '
-                    'style="display:inline" onsubmit="return confirm(\'Delete folder &amp; contents?\')">'
+                    '<form method="post" action="/dashboard/i/' + str(iid) +
+                    '/delete-file" style="display:inline" '
+                    'onsubmit="return confirm(\'Delete folder &amp; contents?\')">'
                     '<input type="hidden" name="f" value="' + esc(rel) + '">'
                     '<input type="hidden" name="p" value="' + esc(path) + '">'
-                    '<button class="btn btn-d btn-xs">Del</button></form></td></tr>'
-                )
+                    '<button class="btn btn-d btn-xs">Del</button></form></td></tr>')
             else:
                 rows_html += (
                     '<tr>'
-                    '<td>📄 <a href="/dashboard/i/' + str(iid) + '/edit?f=' + q + '">' + esc(n) + '</a></td>'
+                    '<td>📄 <a href="/dashboard/i/' + str(iid) + '/edit?f=' + q + '">'
+                    + esc(n) + '</a></td>'
                     '<td class="mut mono" style="font-size:11px">' + human_size(size) + '</td>'
                     '<td style="text-align:right">'
-                    '<a href="/dashboard/i/' + str(iid) + '/download?f=' + q + '" '
-                    'class="btn btn-g btn-xs">Get</a> '
-                    '<form method="post" action="/dashboard/i/' + str(iid) + '/delete-file" '
-                    'style="display:inline" onsubmit="return confirm(\'Delete?\')">'
+                    '<a href="/dashboard/i/' + str(iid) + '/download?f=' + q +
+                    '" class="btn btn-g btn-xs">Get</a> '
+                    '<form method="post" action="/dashboard/i/' + str(iid) +
+                    '/delete-file" style="display:inline" onsubmit="return confirm(\'Delete?\')">'
                     '<input type="hidden" name="f" value="' + esc(rel) + '">'
                     '<input type="hidden" name="p" value="' + esc(path) + '">'
-                    '<button class="btn btn-d btn-xs">Del</button></form></td></tr>'
-                )
+                    '<button class="btn btn-d btn-xs">Del</button></form></td></tr>')
         if not rows_html:
             rows_html = ('<tr><td colspan="3" class="mut" style="padding:26px;text-align:center">'
                          '📭 Empty folder — upload files, a zip, or a tar.gz</td></tr>')
     else:
-        rows_html = '<tr><td colspan="3" class="mut" style="padding:20px;text-align:center">Invalid path</td></tr>'
+        rows_html = ('<tr><td colspan="3" class="mut" style="padding:20px;text-align:center">'
+                     'Invalid path</td></tr>')
 
-    # Breadcrumb
+    # ── Breadcrumb
     crumb = '<a href="/dashboard/i/' + str(iid) + '">🏠 root</a>'
     if path:
         acc = ""
         for part in path.split("/"):
             acc = (acc + "/" + part) if acc else part
-            crumb += ' <span class="sep">/</span> <a href="/dashboard/i/' + str(iid) + '?p=' + urllib.parse.quote(acc) + '">' + esc(part) + '</a>'
+            crumb += (' <span class="sep">/</span> '
+                      '<a href="/dashboard/i/' + str(iid) + '?p=' +
+                      urllib.parse.quote(acc) + '">' + esc(part) + '</a>')
 
     up_btn = ""
     if path:
@@ -1055,7 +1177,7 @@ def inst_detail(iid):
 
     safe_path_attr = esc(path)
 
-    # Tabs
+    # ── Tabs
     tabs = (
         '<div class="tabs">'
         '<button data-tab="files" class="active" onclick="switchTab(\'files\')">📁 Files</button>'
@@ -1065,23 +1187,25 @@ def inst_detail(iid):
         '</div>'
     )
 
-    # Files tab
+    # ── Files tab
     files_tab = (
         '<div class="tab-panel active" data-tab="files"><div class="card">'
         '<div class="crumb">' + crumb + '</div>'
         '<div class="acts" style="margin-bottom:14px">' + up_btn +
-        '<button class="btn btn-g btn-s" onclick="document.getElementById(\'mkfolder\').style.display='
-        'document.getElementById(\'mkfolder\').style.display===\'block\'?\'none\':\'block\'">＋ Folder</button>'
-        '<button class="btn btn-g btn-s" onclick="document.getElementById(\'mkfile\').style.display='
-        'document.getElementById(\'mkfile\').style.display===\'block\'?\'none\':\'block\'">＋ File</button>'
+        '<button class="btn btn-g btn-s" onclick="var e=document.getElementById(\'mkfolder\');'
+        'e.style.display=e.style.display===\'block\'?\'none\':\'block\'">＋ Folder</button>'
+        '<button class="btn btn-g btn-s" onclick="var e=document.getElementById(\'mkfile\');'
+        'e.style.display=e.style.display===\'block\'?\'none\':\'block\'">＋ File</button>'
         '</div>'
         '<div id="mkfolder" style="display:none;margin-bottom:12px">'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/new-folder" style="display:flex;gap:8px">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/new-folder" style="display:flex;gap:8px">'
         '<input type="hidden" name="p" value="' + safe_path_attr + '">'
         '<input name="fname" placeholder="folder-name" required>'
         '<button class="btn btn-p btn-s">Create Folder</button></form></div>'
         '<div id="mkfile" style="display:none;margin-bottom:12px">'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/new-file" style="display:flex;gap:8px">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/new-file" style="display:flex;gap:8px">'
         '<input type="hidden" name="p" value="' + safe_path_attr + '">'
         '<input name="fname" placeholder="filename.txt" required>'
         '<button class="btn btn-p btn-s">Create File</button></form></div>'
@@ -1090,20 +1214,23 @@ def inst_detail(iid):
 
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:20px" id="ups">'
         '<div class="drop">'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/upload" enctype="multipart/form-data">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/upload" enctype="multipart/form-data">'
         '<input type="hidden" name="p" value="' + safe_path_attr + '">'
         '<p class="mut" style="margin-bottom:10px;font-size:13px">⬆ Upload file(s)</p>'
         '<input type="file" name="files" multiple required style="padding:8px;margin-bottom:10px">'
         '<button class="btn btn-p btn-s">Upload</button></form></div>'
         '<div class="drop">'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/upload-archive" enctype="multipart/form-data">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/upload-archive" enctype="multipart/form-data">'
         '<input type="hidden" name="p" value="' + safe_path_attr + '">'
         '<p class="mut" style="margin-bottom:10px;font-size:13px">📦 Upload ZIP / TAR → auto-extract</p>'
-        '<input type="file" name="archive" accept=".zip,.tar,.gz,.tgz,.tar.gz,.tar.bz2,.tar.xz" '
-        'required style="padding:8px;margin-bottom:10px">'
-        '<label style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--mut);'
-        'margin-bottom:10px;justify-content:center">'
-        '<input type="checkbox" name="strip_root" value="1" style="width:auto"> '
+        '<input type="file" name="archive" '
+        'accept=".zip,.tar,.gz,.tgz,.tar.gz,.tar.bz2,.tar.xz" required '
+        'style="padding:8px;margin-bottom:10px">'
+        '<label style="display:flex;align-items:center;gap:7px;font-size:12px;'
+        'color:var(--mut);margin-bottom:10px;justify-content:center">'
+        '<input type="checkbox" name="strip_root" value="1"> '
         'Strip single top-level folder</label>'
         '<button class="btn btn-p btn-s">Extract</button></form></div>'
         '</div>'
@@ -1112,23 +1239,26 @@ def inst_detail(iid):
         '</div>'
     )
 
-    # Console tab
+    # ── Console tab
     log_content = read_log(iid, 20000)
     console_tab = (
         '<div class="tab-panel" data-tab="console"><div class="card">'
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px">'
+        '<div style="display:flex;justify-content:space-between;align-items:center;'
+        'margin-bottom:12px;flex-wrap:wrap;gap:8px">'
         '<h3>Live Console</h3>'
         '<div class="acts">'
         '<span class="mut2 mono">auto-refresh 3 s</span>'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/clear-log" style="display:inline">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/clear-log" style="display:inline">'
         '<button class="btn btn-g btn-s">Clear log</button></form>'
         '</div></div>'
         '<pre id="logbox">' + (esc(log_content) if log_content else
-            '<span style="color:#527a63">— no output yet — start the app to see logs —</span>') + '</pre>'
+            '<span style="color:#527a63">— no output yet — start the app to see logs —</span>')
+        + '</pre>'
         '</div></div>'
     )
 
-    # Settings tab
+    # ── Settings tab
     auto_build_checked = 'checked' if inst["auto_build"] else ''
     autostart_checked  = 'checked' if inst["autostart"] else ''
     settings_tab = (
@@ -1139,61 +1269,67 @@ def inst_detail(iid):
         '<div class="field"><label>Work Directory (relative)</label>'
         '<input name="work_dir" value="' + esc(inst["work_dir"] or "") + '" '
         'placeholder="e.g. myapp-main (or blank for root)">'
-        '<div class="hint">If your zip extracted into a single sub-folder, set this to that folder name.</div>'
-        '</div>'
+        '<div class="hint">If your zip extracted into a single sub-folder, set this to '
+        'that folder name.</div></div>'
 
         '<div class="field"><label>Start Command</label>'
         '<input name="start_cmd" value="' + esc(inst["start_cmd"] or "") + '" '
         'placeholder="e.g. python3 main.py  ·  npm start  ·  uvicorn main:app --port $PORT">'
-        '<div class="hint">Shell command. <code>$PORT</code> and <code>$HOST</code> are set automatically. '
-        'Leave blank for static sites.</div>'
-        '</div>'
+        '<div class="hint">Shell command. <code>$PORT</code> and <code>$HOST</code> '
+        'are set automatically. Leave blank for static sites.</div></div>'
 
         '<div class="field"><label>Build Command</label>'
         '<input name="build_cmd" value="' + esc(inst["build_cmd"] or "") + '" '
-        'placeholder="e.g. pip install -r requirements.txt  ·  npm install &amp;&amp; npm run build">'
-        '<div class="hint">Runs before start when Auto-build is on. Optional.</div>'
-        '</div>'
+        'placeholder="e.g. pip install -r requirements.txt  ·  '
+        'npm install &amp;&amp; npm run build">'
+        '<div class="hint">Runs before start when Auto-build is on. Optional.</div></div>'
 
         '<div class="field"><label>Environment Variables</label>'
-        '<textarea name="env" rows="5" placeholder="KEY=value&#10;ANOTHER_KEY=another">'
+        '<textarea name="env" rows="5" '
+        'placeholder="KEY=value&#10;ANOTHER_KEY=another">'
         + esc(inst["env"] or "") + '</textarea>'
-        '<div class="hint">One <code>KEY=VALUE</code> per line. Lines starting with <code>#</code> are ignored.</div>'
-        '</div>'
+        '<div class="hint">One <code>KEY=VALUE</code> per line. Lines starting with '
+        '<code>#</code> are ignored.</div></div>'
 
         '<div style="display:flex;gap:22px;margin-bottom:18px;flex-wrap:wrap">'
-        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin:0">'
+        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;'
+        'color:var(--txt);margin:0">'
         '<input type="checkbox" name="auto_build" value="1" ' + auto_build_checked +
-        ' style="width:auto"> Auto-build on start</label>'
-        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--txt);margin:0">'
+        '> Auto-build on start</label>'
+        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;'
+        'color:var(--txt);margin:0">'
         '<input type="checkbox" name="autostart" value="1" ' + autostart_checked +
-        ' style="width:auto"> Auto-restart (24×7)</label>'
+        '> Auto-restart (24×7)</label>'
         '</div>'
 
         '<div class="acts">'
         '<button class="btn btn-p">💾 Save Settings</button>'
         '</form>'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/auto-detect" style="display:inline">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/auto-detect" style="display:inline">'
         '<button class="btn btn-w">🪄 Auto-detect Commands</button></form>'
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/build" style="display:inline">'
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/build" style="display:inline">'
         '<button class="btn btn-g">⚙ Run Build Now</button></form>'
         '</div>'
         '</div></div>'
     )
 
-    # Activity tab
+    # ── Activity tab
     d = db()
-    acts = d.execute("SELECT * FROM activity WHERE iid=? ORDER BY id DESC LIMIT 60", (iid,)).fetchall()
+    acts = d.execute("SELECT * FROM activity WHERE iid=? ORDER BY id DESC LIMIT 60",
+                     (iid,)).fetchall()
     d.close()
     acts_html = ""
     for a in acts:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["ts"]))
-        kind = esc(a["kind"])
-        acts_html += ('<tr><td class="mut mono" style="font-size:11px;white-space:nowrap">' + ts + '</td>'
-                      '<td><span class="tag tag-info">' + kind + '</span></td>'
+        acts_html += ('<tr><td class="mut mono" style="font-size:11px;white-space:nowrap">'
+                      + ts + '</td>'
+                      '<td><span class="tag tag-info">' + esc(a["kind"]) + '</span></td>'
                       '<td class="mono" style="font-size:12px">' + esc(a["message"]) + '</td></tr>')
     if not acts_html:
-        acts_html = '<tr><td colspan="3" class="mut" style="padding:20px;text-align:center">No activity yet</td></tr>'
+        acts_html = ('<tr><td colspan="3" class="mut" style="padding:20px;text-align:center">'
+                     'No activity yet</td></tr>')
     activity_tab = (
         '<div class="tab-panel" data-tab="activity"><div class="card">'
         '<h3 style="margin-bottom:14px">Recent Activity</h3>'
@@ -1202,16 +1338,20 @@ def inst_detail(iid):
         '</div></div>'
     )
 
-    # Header actions
+    # ── Header actions
     if is_live:
         start_btn = ''
-        stop_btn = ('<form method="post" action="/dashboard/i/' + str(iid) + '/stop" style="display:inline">'
+        stop_btn = ('<form method="post" action="/dashboard/i/' + str(iid) +
+                    '/stop" style="display:inline">'
                     '<button class="btn btn-g btn-s">⏹ Stop</button></form>')
-        restart_btn = ('<form method="post" action="/dashboard/i/' + str(iid) + '/restart" style="display:inline">'
+        restart_btn = ('<form method="post" action="/dashboard/i/' + str(iid) +
+                       '/restart" style="display:inline">'
                        '<button class="btn btn-g btn-s">↻ Restart</button></form>')
-        open_btn = '<a href="/app/' + str(iid) + '/" target="_blank" class="btn btn-p btn-s">↗ Open</a>'
+        open_btn = ('<a href="/app/' + str(iid) +
+                    '/" target="_blank" class="btn btn-p btn-s">↗ Open</a>')
     else:
-        start_btn = ('<form method="post" action="/dashboard/i/' + str(iid) + '/start" style="display:inline">'
+        start_btn = ('<form method="post" action="/dashboard/i/' + str(iid) +
+                     '/start" style="display:inline">'
                      '<button class="btn btn-p btn-s">▶ Start</button></form>')
         stop_btn = ''
         restart_btn = ''
@@ -1232,7 +1372,8 @@ def inst_detail(iid):
         ' · slug ' + esc(inst["slug"]) + '</p>'
         '</div>'
         '<div class="acts">' + start_btn + stop_btn + restart_btn + open_btn +
-        '<form method="post" action="/dashboard/i/' + str(iid) + '/delete" style="display:inline" '
+        '<form method="post" action="/dashboard/i/' + str(iid) +
+        '/delete" style="display:inline" '
         'onsubmit="return confirm(\'Delete this instance and all its files?\')">'
         '<button class="btn btn-d btn-s">🗑 Delete</button></form></div></div>'
 
@@ -1280,12 +1421,12 @@ def inst_edit(iid):
     back = "/dashboard/i/" + str(iid) + ("?p=" + urllib.parse.quote(parent) if parent else "")
     body = (
         '<a href="' + back + '" class="mut" style="font-size:13px">← Back</a>'
-        '<h1 style="margin-top:6px">Edit: <span class="mono" style="font-size:.7em;color:var(--pri2)">'
-        + esc(fname) + '</span></h1>'
+        '<h1 style="margin-top:6px">Edit: <span class="mono" '
+        'style="font-size:.7em;color:var(--pri2)">' + esc(fname) + '</span></h1>'
         '<form method="post" action="/dashboard/i/' + str(iid) + '/save">'
         '<input type="hidden" name="f" value="' + esc(fname) + '">'
-        '<textarea name="content" style="min-height:520px;margin-top:14px" spellcheck="false">'
-        + esc(content) + '</textarea>'
+        '<textarea name="content" style="min-height:520px;margin-top:14px" '
+        'spellcheck="false">' + esc(content) + '</textarea>'
         '<div class="acts" style="margin-top:14px">'
         '<button class="btn btn-p">💾 Save</button>'
         '<a href="' + back + '" class="btn btn-g">Cancel</a>'
@@ -1314,7 +1455,8 @@ def inst_download(iid):
     fname = norm_rel(request.args.get("f", ""))
     fp = safe_join(inst_dir(inst), fname)
     if not fp or not os.path.isfile(fp): abort(404)
-    return send_from_directory(os.path.dirname(fp), os.path.basename(fp), as_attachment=True)
+    return send_from_directory(os.path.dirname(fp), os.path.basename(fp),
+                               as_attachment=True)
 
 @app.route("/dashboard/i/<int:iid>/upload", methods=["POST"])
 @login_required
@@ -1354,7 +1496,6 @@ def inst_upload_archive(iid):
         data = f.read()
         count, kind = extract_archive(data, f.filename, target, strip_root=strip)
         flash("Extracted " + str(count) + " file(s) from " + kind, "ok")
-        # Re-detect commands after a fresh extraction
         if not (inst["start_cmd"] or "").strip() and not (inst["build_cmd"] or "").strip():
             s, b = detect_commands(inst_work_dir(inst), inst["type"])
             if s or b:
@@ -1364,6 +1505,7 @@ def inst_upload_archive(iid):
                 d.commit(); d.close()
                 flash("Auto-detected commands", "ok")
     except Exception as e:
+        print("[extract]", e, "\n", traceback.format_exc(), flush=True)
         flash("Extract error: " + str(e), "err")
     return redirect(url_for("inst_detail", iid=iid, p=p))
 
@@ -1420,7 +1562,6 @@ def inst_delfile(iid):
 def inst_start(iid):
     inst = get_inst(iid)
     if inst:
-        # Auto-build if requested and not built yet
         if inst["auto_build"] and not inst["deps_ready"] and inst["build_cmd"]:
             build_inst(iid, async_=False)
         start_inst(inst)
@@ -1481,7 +1622,7 @@ def inst_auto_detect(iid):
     d.execute("UPDATE instances SET start_cmd=?, build_cmd=? WHERE id=?", (s, b, iid))
     d.commit(); d.close()
     if s or b:
-        flash("Auto-detected: start = %r · build = %r" % (s, b), "ok")
+        flash("Auto-detected → start: %s  ·  build: %s" % (s or "—", b or "—"), "ok")
     else:
         flash("Could not detect — set commands manually", "err")
     return redirect(url_for("inst_detail", iid=iid))
@@ -1505,7 +1646,7 @@ def inst_save_settings(iid):
     flash("Settings saved", "ok")
     return redirect(url_for("inst_detail", iid=iid))
 
-# ─────────────────────────── Activity & docs pages ────────────────────
+# ─────────────────────────── Activity & docs ──────────────────────────
 @app.route("/activity")
 @login_required
 def activity_page():
@@ -1518,17 +1659,19 @@ def activity_page():
     html = ""
     for a in rows:
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(a["ts"]))
-        html += ('<tr><td class="mut mono" style="font-size:11px;white-space:nowrap">' + ts + '</td>'
+        html += ('<tr><td class="mut mono" style="font-size:11px;white-space:nowrap">'
+                 + ts + '</td>'
                  '<td>' + esc(a["iname"] or "—") + '</td>'
                  '<td><span class="tag tag-info">' + esc(a["kind"]) + '</span></td>'
                  '<td class="mono" style="font-size:12px">' + esc(a["message"]) + '</td></tr>')
     if not html:
-        html = '<tr><td colspan="4" class="mut" style="padding:26px;text-align:center">No activity yet</td></tr>'
+        html = ('<tr><td colspan="4" class="mut" style="padding:26px;text-align:center">'
+                'No activity yet</td></tr>')
     body = (
         '<h1 style="margin-bottom:6px">Activity</h1>'
         '<p class="mut" style="margin-bottom:20px">Recent events across all instances.</p>'
-        '<div class="card"><table><thead><tr><th>Time</th><th>Instance</th><th>Type</th><th>Message</th>'
-        '</tr></thead><tbody>' + html + '</tbody></table></div>'
+        '<div class="card"><table><thead><tr><th>Time</th><th>Instance</th>'
+        '<th>Type</th><th>Message</th></tr></thead><tbody>' + html + '</tbody></table></div>'
     )
     return render("Activity", body, active="act")
 
@@ -1560,7 +1703,8 @@ Python Flask → <code>python3 app.py</code><br>
 FastAPI → <code>uvicorn main:app --host 0.0.0.0 --port $PORT</code><br>
 Django → <code>python3 manage.py runserver 0.0.0.0:$PORT</code><br>
 Node → <code>npm start</code> or <code>node index.js</code><br>
-Build → <code>pip install -r requirements.txt</code> or <code>npm install &amp;&amp; npm run build</code>
+Build → <code>pip install -r requirements.txt</code> or
+<code>npm install &amp;&amp; npm run build</code>
 </div>
 </div>
 
@@ -1619,10 +1763,11 @@ def proxy(iid, path):
 
     if not is_running(iid):
         return Response(
-            "<html><body style='background:#040b07;color:#ff5577;font-family:monospace;"
-            "padding:30px'><h3>◈ Instance not running</h3>"
-            "<p style='color:#7ea88f'>Start it from the dashboard.</p></body></html>",
-            status=502, mimetype="text/html")
+            "<html><body style='background:#040b07;color:#ff5577;"
+            "font-family:ui-monospace,monospace;padding:30px'>"
+            "<h3>◈ Instance not running</h3>"
+            "<p style='color:#7ea88f'>Start it from the dashboard.</p>"
+            "</body></html>", status=502, mimetype="text/html")
 
     target = "http://127.0.0.1:" + str(inst["port"]) + "/" + path
     if request.query_string:
@@ -1633,7 +1778,8 @@ def proxy(iid, path):
             if k.lower() not in ("host", "content-length", "connection",
                                  "accept-encoding"):
                 req.add_header(k, v)
-        body = request.get_data() if request.method in ("POST", "PUT", "PATCH", "DELETE") else None
+        body = (request.get_data()
+                if request.method in ("POST", "PUT", "PATCH", "DELETE") else None)
         with urllib.request.urlopen(req, data=body, timeout=60) as r:
             headers = {k: v for k, v in r.headers.items()
                        if k.lower() not in ("transfer-encoding", "connection",
@@ -1643,10 +1789,10 @@ def proxy(iid, path):
         return Response(e.read(), status=e.code)
     except Exception as e:
         return Response(
-            "<html><body style='background:#040b07;color:#ff5577;font-family:monospace;"
-            "padding:30px'><h3>◈ Proxy error</h3><pre>" + esc(str(e)) +
-            "</pre></body></html>",
-            status=502, mimetype="text/html")
+            "<html><body style='background:#040b07;color:#ff5577;"
+            "font-family:ui-monospace,monospace;padding:30px'>"
+            "<h3>◈ Proxy error</h3><pre>" + esc(str(e)) + "</pre>"
+            "</body></html>", status=502, mimetype="text/html")
 
 # ─────────────────────────────── Scaffolds ────────────────────────────
 PY_MAIN = '''#!/usr/bin/env python3
@@ -1769,11 +1915,15 @@ def boot_autostart():
         d.close()
         for r in rows:
             inst = get_inst(r["id"])
-            if inst:
-                print("[boot] restoring", inst["name"])
+            if inst and inst["type"] != "static":
+                print("[boot] restoring", inst["name"], flush=True)
                 start_inst(inst)
+            elif inst and inst["type"] == "static":
+                d = db()
+                d.execute("UPDATE instances SET status='running' WHERE id=?", (inst["id"],))
+                d.commit(); d.close()
     except Exception as e:
-        print("[boot]", e)
+        print("[boot]", e, flush=True)
 
 threading.Thread(target=boot_autostart, daemon=True).start()
 threading.Thread(target=watchdog, daemon=True).start()
@@ -1781,11 +1931,11 @@ threading.Thread(target=watchdog, daemon=True).start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     print("\n╔══════════════════════════════════════════════════╗")
-    print("║  MODx Hosting Panel · Nebula Edition              ║")
+    print("║  MODx Hosting Panel · Nebula Edition · v1.0       ║")
     print("╠══════════════════════════════════════════════════╣")
-    print("║  URL       → http://0.0.0.0:%d" % port)
-    print("║  Username  → %s" % AUTH_USER)
-    print("║  Password  → %s" % AUTH_PASS)
-    print("║  Storage   → %s" % BASE_DIR)
+    print("║  URL       → http://0.0.0.0:%-5d                 ║" % port)
+    print("║  Username  → %-35s║" % AUTH_USER)
+    print("║  Password  → %-35s║" % AUTH_PASS)
+    print("║  Storage   → %-35s║" % BASE_DIR)
     print("╚══════════════════════════════════════════════════╝\n")
     app.run(host="0.0.0.0", port=port, threaded=True)

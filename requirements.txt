@@ -1,0 +1,5 @@
+# ── MODx Hosting Panel ──
+# Only Flask is 3rd-party. Everything else is stdlib.
+
+Flask==3.0.3
+gunicorn==22.0.0
